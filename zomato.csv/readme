@@ -1,0 +1,204 @@
+1. Upload this DAG file
+Upload the updated zomato_etl_dag.py to:
+gs://us-central1-zomato-composer-a32aae74-bucket/dags/
+
+2. Start Dataflow job manually (only once):
+
+python3 dataflow_job.py \
+  --input_topic=projects/swift-setup-461011-s1/topics/zomato_csv_topic \
+  --output_table=swift-setup-461011-s1:zomato_new.staging_restaurant_data \
+  --runner=DataflowRunner \
+  --project=swift-setup-461011-s1 \
+  --temp_location=gs://zomato-analysis-cleaninggg/tmp/ \
+  --region=asia-south1 \
+  --streaming
+
+
+This will run forever (until manually cancelled) and handle any future Pub/Sub messages.
+
+3. Upload .csv files to gs://zomato-analysis-cleaninggg/raw/
+The DAG will detect new files, send a Pub/Sub message, and the running Dataflow job will process and write them into BigQuery.
+
+4. To Pull the messages if working: 
+gcloud pubsub subscriptions pull projects/swift-setup-461011-s1/subscriptions/zomato_csv_sub --limit=1 --auto-ack
+
+
+__________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________
+
+ To Verify It Works:
+Here’s what you can do to confirm everything is working properly:
+
+Upload a new CSV file (with unique content) to:
+gs://zomato-analysis-cleaninggg/raw/new_test_file.csv
+Wait for ~1–3 minutes after the next DAG run.
+
+In BigQuery, run:
+
+SELECT * 
+FROM `swift-setup-461011-s1.zomato_new.zomato_data`
+ORDER BY ingestion_date DESC
+LIMIT 50;
+Check if the new data appears — look for the rows from your new test file.
+
+__________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________
+
+ Correct CSV Format (NO header, integers only):
+
+400,10,5,4.2,150,400,2025-05-28
+401,11,3,3.8,200,350,2025-05-28
+402,12,2,4.5,250,500,2025-05-28
+
+ Fix Steps:
+
+1.Open your CSV file
+
+2.Delete the header row
+
+3.Convert all approx_cost_for_two values to integers (remove .0)
+
+4.Save the file (e.g., clean_data.csv)
+
+5.Upload to GCS → gs://zomato-analysis-cleaninggg/raw/clean_data.csv
+
+6.Trigger the Airflow DAG (or wait if it's scheduled)
+
+ Test File (copy/paste into clean_data.csv):
+400,10,5,4.2,150,400,2025-05-28
+401,11,3,3.8,200,350,2025-05-28
+402,12,2,4.5,250,500,2025-05-28
+
+Once uploaded and DAG runs, your Dataflow logs should no longer show parsing errors, and you should see the data in BigQuery:
+SELECT * 
+FROM `swift-setup-461011-s1.zomato_new.zomato_data`
+ORDER BY ingestion_date DESC
+
+
+7. for checking Duplicates in Fact Table : 
+SELECT restaurant_id, location_id, cuisine_id, COUNT(*) as count
+FROM `swift-setup-461011-s1.zomato_new.fact_restaurant_data`
+GROUP BY restaurant_id, location_id, cuisine_id
+HAVING COUNT(*) > 1;
+
+
+
+=========================================================================================================================================================================================
+
+
+=====================================================================================
+
+create View : 
+
+1. Full rest details : 
+
+CREATE OR REPLACE VIEW `zomato_new.full_restaurant_details` AS
+SELECT 
+  r.restaurant_id,
+  r.name,
+  r.address,
+  r.phone,
+  r.online_order,
+  r.book_table,
+  r.rest_type,
+  r.dish_liked,
+  l.location,
+  l.listed_in_city,
+  c.cuisines,
+  f.rate,
+  f.votes,
+  f.approx_cost_for_two
+FROM `zomato_new.fact_restaurant_data` f
+JOIN `zomato_new.dim_restaurant` r ON f.restaurant_id = r.restaurant_id
+JOIN `zomato_new.dim_location` l ON f.location_id = l.location_id
+JOIN `zomato_new.dim_cuisine` c ON f.cuisine_id = c.cuisine_id;
+
+2. Average Rating by City:
+
+CREATE OR REPLACE VIEW `zomato_new.vw_avg_rating_by_city` AS
+SELECT 
+  listed_in_city,
+  ROUND(AVG(rate), 2) AS avg_rating,
+  COUNT(*) AS total_restaurants
+FROM `zomato_new.vw_restaurant_details`
+GROUP BY listed_in_city
+ORDER BY avg_rating DESC;
+
+3. Top Cuisines by Total Votes:
+
+CREATE OR REPLACE VIEW `zomato_new.vw_top_cuisines` AS
+SELECT 
+  cuisines,
+  SUM(votes) AS total_votes,
+  COUNT(*) AS num_restaurants
+FROM `zomato_new.vw_restaurant_details`
+GROUP BY cuisines
+ORDER BY total_votes DESC
+LIMIT 10;
+
+4. Cost vs Rating:
+
+CREATE OR REPLACE VIEW `zomato_new.vw_cost_vs_rating` AS
+SELECT 
+  ROUND(approx_cost_for_two, -2) AS cost_bucket,
+  ROUND(AVG(rate), 2) AS avg_rating,
+  COUNT(*) AS count
+FROM `zomato_new.vw_restaurant_details`
+WHERE approx_cost_for_two IS NOT NULL
+GROUP BY cost_bucket
+ORDER BY cost_bucket;
+
+5. Heatmap of Location × Cuisine Popularity:
+
+CREATE OR REPLACE VIEW `zomato_new.vw_location_cuisine_heatmap` AS
+SELECT 
+  location,
+  cuisines,
+  COUNT(*) AS num_restaurants,
+  ROUND(AVG(rate), 2) AS avg_rating
+FROM `zomato_new.vw_restaurant_details`
+GROUP BY location, cuisines
+ORDER BY num_restaurants DESC;
+
+6. Table_reservation_trends:
+
+CREATE OR REPLACE VIEW `swift-setup-461011-s1.zomato_new.vw_table_reservation_trends` AS
+SELECT
+  book_table,
+  COUNT(*) AS total_restaurants,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS percentage
+FROM `swift-setup-461011-s1.zomato_new.dim_restaurant`
+GROUP BY book_table;
+
+7. online_order_by_city:
+
+CREATE OR REPLACE VIEW `swift-setup-461011-s1.zomato_new.vw_online_order_by_city` AS
+SELECT
+  dl.listed_in_city,
+  dr.online_order,
+  COUNT(*) AS restaurant_count
+FROM `swift-setup-461011-s1.zomato_new.fact_restaurant_data` f
+JOIN `swift-setup-461011-s1.zomato_new.dim_restaurant` dr USING (restaurant_id)
+JOIN `swift-setup-461011-s1.zomato_new.dim_location` dl USING (location_id)
+GROUP BY dl.listed_in_city, dr.online_order;
+
+8. Rating_distribution:
+
+CREATE OR REPLACE VIEW `swift-setup-461011-s1.zomato_new.vw_rating_distribution` AS
+SELECT
+  rate,
+  COUNT(*) AS count
+FROM `swift-setup-461011-s1.zomato_new.fact_restaurant_data`
+WHERE rate IS NOT NULL AND rate > 0
+GROUP BY rate
+ORDER BY rate;
+================================================================================================================
+
+SELECT * FROM `swift-setup-461011-s1.zomato_new.fact_restaurant_data`
+WHERE ingestion_date = "2025-06-03"
+ORDER BY restaurant_id;
+============================================================
+
+SELECT * FROM `swift-setup-461011-s1.zomato_new.staging_restaurant_data`
+WHERE ingestion_date = "2025-06-03"
+ORDER BY restaurant_id;
+
+
